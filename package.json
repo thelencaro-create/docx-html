@@ -1,0 +1,9 @@
+{
+  "name": "docx-html",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "mammoth": "^1.6.0"
+  }
+}
