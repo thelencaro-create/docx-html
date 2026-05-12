@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "dependencies": {
-    "mammoth": "^1.6.0"
+    "mammoth": "^1.6.0",
+    "jszip": "^3.10.1"
   }
 }
