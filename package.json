@@ -1,10 +1,12 @@
 {
   "name": "docx-html",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "private": true,
   "dependencies": {
     "mammoth": "^1.6.0",
-    "jszip": "^3.10.1"
+    "jszip": "^3.10.1",
+    "exceljs": "^4.4.0",
+    "pdf-parse": "^1.1.1"
   }
 }
