@@ -1,29 +1,35 @@
 import mammoth from "mammoth";
 import JSZip from "jszip";
+import ExcelJS from "exceljs";
+import pdfParse from "pdf-parse";
 
 /**
- * docx-html v2 — DOCX→HTML mit Cell-Shading-Erkennung
+ * screener-extract — DOCX/XLSX/PDF → HTML
  *
- * v2 (neu): Erkennt farbig hinterlegte Tabellen-Zellen aus dem DOCX-XML
- * (<w:tcPr><w:shd w:fill="HEXFARBE"/></w:tcPr>) und ergänzt deren
- * Textinhalt mit dem Marker [[SHADED]] vor dem ersten Zeichen jedes Runs.
+ * Vereinheitlichter Eintrittspunkt für die Preview-Generator-Pipeline.
+ * Liefert für alle drei Formate einheitliches HTML mit [[SHADED]]-Markern
+ * an hinterlegten Tabellen-Zellen.
  *
- * Hintergrund Mars Q19: Bestimmte Zellen (Matrix-Items × Skala-Codes) sind
- * im Original-Screener farbig markiert — das sind die erlaubten Antworten.
- * Mammoth verliert diese Information beim HTML-Export. Wir lesen sie deshalb
- * direkt aus der document.xml und re-injecten den Marker in den HTML-Output.
+ * Konsistenzen mit docx-html.js (v2-shading):
+ *  - selber Marker [[SHADED]]
+ *  - selbe Occurrence-basierte Logik für DOCX
+ *  - selbe Fail-Soft-Strategie bei Shading-Extraktion
  *
- * Funktioniert mit ALLEN Shading-Farben (Hellblau, Grün, Gelb, Rosa, ...).
- * Ausgeschlossen werden nur "kein Fill"-Werte: "auto", "FFFFFF", "ffffff", null.
+ * NEU gegenüber docx-html.js:
+ *  - XLSX-Support via ExcelJS (Shading aus cell.fill.fgColor)
+ *  - PDF-Support via pdf-parse (Plaintext → <p>-Tags, ohne Shading)
+ *  - Format-Auto-Detection via mimeType oder fileName
  *
- * Marker-Wahl: [[SHADED]] (statt [[BLAU]]) — farbneutral, weil die
- * Recruiter-Anweisung im Screener immer auf "die markierten Felder"
- * verweist, unabhängig von der konkreten Farbe.
+ * Endpoint: POST /api/screener-extract
+ * Request:  { data: <base64>, fileName?: string, mimeType?: string }
+ * Response: { html, _format, _shadedCount, _shadedSampleTexts, _version }
+ *
+ * Marker-Form [[SHADED]] passt zum bestehenden Hardening / Parser-Prompt.
  */
 
-// -------------------------------------------------------------
-// Helpers (unverändert aus v1)
-// -------------------------------------------------------------
+// =============================================================================
+// HELPERS (kopiert/angepasst aus docx-html.js für Konsistenz)
+// =============================================================================
 function toBufferFromBase64(input) {
   const s = String(input ?? "").trim();
   const clean = s.includes("base64,") ? s.split("base64,").pop() : s;
@@ -37,89 +43,59 @@ function hasEOCD(buf) {
   const start = Math.max(0, buf.length - 70000);
   return buf.slice(start).indexOf(sig) !== -1;
 }
+function isPdf(buf) {
+  return buf.length >= 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
+}
+function normalizeText(s) {
+  return String(s).replace(/\s+/g, " ").trim().toLowerCase();
+}
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
-// -------------------------------------------------------------
-// SHADING-EXTRAKTOR (neu)
-// -------------------------------------------------------------
+function detectFormat({ fileName, mimeType, buf }) {
+  const fn = String(fileName || "").toLowerCase();
+  const mt = String(mimeType || "").toLowerCase();
+  if (fn.endsWith(".docx") || mt.includes("wordprocessingml")) return "docx";
+  if (fn.endsWith(".xlsx") || fn.endsWith(".xls") || mt.includes("spreadsheetml") || mt.includes("excel")) return "xlsx";
+  if (fn.endsWith(".pdf") || mt.includes("pdf")) return "pdf";
+  // Magic-Bytes-Fallback
+  if (buf && isPdf(buf)) return "pdf";
+  return null;
+}
 
-/**
- * Liest aus document.xml alle Tabellen-Zellen mit Cell-Shading und liefert
- * eine Liste der Texte, die in solchen Zellen stehen.
- *
- * Zwei Quellen pro Zelle:
- *   1) Direkt-Shading:   <w:tcPr><w:shd w:fill="HEX"/></w:tcPr>
- *   2) Style-Shading via <w:cnfStyle/> ist möglich, aber selten und wird
- *      hier nicht abgedeckt — die meisten Screener nutzen Direkt-Shading.
- *
- * Rückgabe: Set<string> mit normalisierten Texten (lowercase, getrimmt,
- * Whitespace kollabiert), die in shaded cells stehen. Wir nutzen das später
- * als Lookup beim HTML-Post-Processing.
- *
- * Mit Marker-Position: Ein Text kann mehrfach im Dokument vorkommen, aber
- * nur in einer der Vorkommen shaded sein. Wir speichern deshalb zusätzlich
- * die Sequenz (Reihenfolge im Doc), damit der Marker-Inject die N-te
- * Occurrence treffen kann.
- */
-function isShadedFill(fill) {
+// =============================================================================
+// DOCX — identisch zu docx-html.js v2-shading
+// =============================================================================
+function isShadedFillDocx(fill) {
   if (!fill) return false;
   const f = String(fill).trim().toLowerCase();
-  // "auto" oder reines Weiß = kein Shading
   if (f === "auto" || f === "ffffff" || f === "fff" || f === "none") return false;
-  // Hex-Pattern check — nur 3- oder 6-stellig
   if (!/^[0-9a-f]{3}$|^[0-9a-f]{6}$/.test(f)) return false;
   return true;
 }
 
-/**
- * Extrahiert alle shaded Text-Vorkommen aus document.xml.
- * Liefert ein Array von { text, occurrenceIdx } pro shaded Zelle.
- * Die occurrenceIdx ist die N-te Occurrence dieses Texts (0-basiert) bezogen
- * auf alle Tabellen-Zellen-Texte im Dokument (auch nicht-shaded).
- *
- * Diese Buchführung ist nötig, weil derselbe Text (z.B. "5") in vielen
- * Zellen einer Matrix auftaucht, aber nur in manchen shaded ist.
- */
-function extractShadedCellTexts(docXml) {
-  // Wir parsen iterativ mit Regex — voller XML-Parser wäre overkill und
-  // bringt Dependencies. Die Struktur ist:
-  //   <w:tbl>
-  //     <w:tr>
-  //       <w:tc>
-  //         <w:tcPr>
-  //           <w:shd w:fill="..."/>  (optional)
-  //         </w:tcPr>
-  //         <w:p>...Text...</w:p>
-  //       </w:tc>
-  //     </w:tr>
-  //   </w:tbl>
-  //
-  // Strategie: alle <w:tc>...</w:tc> Blocks holen (in Reihenfolge), pro Block
-  // (a) prüfen ob shaded, (b) gesamten Text extrahieren.
-
+function extractDocxShadedOccurrences(docXml) {
   const tcRegex = /<w:tc(?:\s[^>]*)?>([\s\S]*?)<\/w:tc>/g;
   const tcBlocks = [];
   let m;
-  while ((m = tcRegex.exec(docXml)) !== null) {
-    tcBlocks.push(m[1]);
-  }
+  while ((m = tcRegex.exec(docXml)) !== null) tcBlocks.push(m[1]);
 
-  // Pro Zelle: shaded? + Text
   const cells = tcBlocks.map(inner => {
-    // Shading aus tcPr lesen
     const tcPrMatch = inner.match(/<w:tcPr>([\s\S]*?)<\/w:tcPr>/);
     let shaded = false;
     if (tcPrMatch) {
       const shdMatch = tcPrMatch[1].match(/<w:shd\b[^/>]*w:fill="([^"]+)"/);
-      if (shdMatch) {
-        shaded = isShadedFill(shdMatch[1]);
-      }
+      if (shdMatch) shaded = isShadedFillDocx(shdMatch[1]);
     }
-    // Text aus allen <w:t>...</w:t> innerhalb der Zelle zusammensetzen
     const textParts = [];
     const tRegex = /<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g;
     let tm;
     while ((tm = tRegex.exec(inner)) !== null) {
-      // XML-Entities zurück
       const t = tm[1]
         .replace(/&amp;/g, "&")
         .replace(/&lt;/g, "<")
@@ -128,15 +104,11 @@ function extractShadedCellTexts(docXml) {
         .replace(/&apos;/g, "'");
       textParts.push(t);
     }
-    const text = textParts.join("").trim();
-    return { shaded, text };
+    return { shaded, text: textParts.join("").trim() };
   });
 
-  // Pro Text die occurrence-Indices (0-basiert) der shaded-Treffer sammeln
-  // Beispiel: Text "5" kommt 6x vor, davon shaded an Position 0 und 3.
-  // → shadedOccurrences["5"] = [0, 3]
-  const counter = new Map(); // text -> running count
-  const shadedOccurrences = new Map(); // text -> [occIdx, ...]
+  const counter = new Map();
+  const shadedOccurrences = new Map();
   for (const c of cells) {
     if (!c.text) continue;
     const key = normalizeText(c.text);
@@ -147,131 +119,263 @@ function extractShadedCellTexts(docXml) {
     }
     counter.set(key, idx + 1);
   }
-
   return shadedOccurrences;
 }
 
-function normalizeText(s) {
-  return String(s).replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-// -------------------------------------------------------------
-// HTML-POST-PROCESSING: Marker einfügen
-// -------------------------------------------------------------
-
-/**
- * Geht das HTML nach <td>-Zellen durch. Pro Zelle:
- *  - Cell-Text normalisieren
- *  - Counter pro Text hochzählen
- *  - Wenn (text, counter) in shadedOccurrences enthalten → Marker einfügen
- *
- * Reihenfolge ist entscheidend: Mammoth gibt Tabellen-Zellen in derselben
- * Reihenfolge aus wie die DOCX-XML sie definiert. Das matcht 1:1 mit
- * unserer Zähl-Logik aus extractShadedCellTexts.
- *
- * Marker-Form: Wir setzen [[SHADED]] DIREKT vor den ersten sichtbaren
- * Zeichen-Block der Zelle. Damit bleibt der Marker an Codes wie "5"
- * sichtbar und der nachfolgende Plain-Text-Cleanup im Hardening kann ihn
- * leicht greifen.
- */
-function injectShadedMarkers(html, shadedOccurrences) {
+function injectShadedMarkersInHtml(html, shadedOccurrences) {
   if (!shadedOccurrences || shadedOccurrences.size === 0) return html;
-
   const counter = new Map();
-
   return html.replace(/<td\b([^>]*)>([\s\S]*?)<\/td>/gi, (match, attrs, inner) => {
-    // Inneren Text ohne Tags ermitteln für Lookup
     const plain = inner.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
     const key = normalizeText(plain);
     if (!key) return match;
-
     const idx = counter.get(key) || 0;
     counter.set(key, idx + 1);
-
     const occs = shadedOccurrences.get(key);
     if (!occs || !occs.includes(idx)) return match;
 
-    // Marker einfügen — vor dem ersten Zeichen des ersten Text-Blocks im inner
-    // Trick: ersetze den ersten "Text"-Run. Wenn inner mit "<p>...</p>" anfängt,
-    // landen wir nach dem öffnenden <p>. Wenn nicht, prefixen wir den inner direkt.
     let newInner;
     const firstTextMatch = inner.match(/>([^<]*\S[^<]*)</);
     if (firstTextMatch) {
-      // Erstes nicht-leeres Text-Stück gefunden
       newInner = inner.replace(firstTextMatch[0], `>[[SHADED]]${firstTextMatch[1]}<`);
     } else {
-      // Fallback: ganz vorn anflanschen
       newInner = `[[SHADED]]${inner}`;
     }
     return `<td${attrs}>${newInner}</td>`;
   });
 }
 
-// -------------------------------------------------------------
-// MAIN HANDLER
-// -------------------------------------------------------------
+async function extractDocx(buf) {
+  if (!isZip(buf) || !hasEOCD(buf) || buf.length < 1024) {
+    throw new Error("Invalid DOCX/ZIP payload");
+  }
+  const result = await mammoth.convertToHtml({ buffer: buf });
+  let html = String(result.value || "").trim();
 
+  let shadedCount = 0;
+  let shadedSampleTexts = [];
+  try {
+    const zip = await JSZip.loadAsync(buf);
+    const docXmlFile = zip.file("word/document.xml");
+    if (docXmlFile) {
+      const docXml = await docXmlFile.async("string");
+      const shadedOccurrences = extractDocxShadedOccurrences(docXml);
+      shadedCount = [...shadedOccurrences.values()].reduce((s, arr) => s + arr.length, 0);
+      shadedSampleTexts = [...shadedOccurrences.keys()].slice(0, 10);
+      if (shadedCount > 0) html = injectShadedMarkersInHtml(html, shadedOccurrences);
+    }
+  } catch (e) {
+    console.warn("DOCX shading extraction failed (non-fatal):", e.message);
+  }
+
+  return { html, shadedCount, shadedSampleTexts };
+}
+
+// =============================================================================
+// XLSX — via ExcelJS, [[SHADED]]-Marker an Zellen mit Hintergrund-Farbe
+// =============================================================================
+function isShadedFillXlsx(fgColor) {
+  if (!fgColor) return false;
+  const argb = String(fgColor.argb || "").toUpperCase();
+  if (!argb) return false;
+  if (argb === "FFFFFFFF" || argb === "00000000" || argb === "FFFFFF") return false;
+  return true;
+}
+
+function parseRef(ref) {
+  const m = String(ref || "").match(/^([A-Z]+)(\d+)$/);
+  if (!m) return null;
+  const letters = m[1];
+  const row = parseInt(m[2], 10);
+  let col = 0;
+  for (let i = 0; i < letters.length; i++) {
+    col = col * 26 + (letters.charCodeAt(i) - 64);
+  }
+  return { row, col };
+}
+
+function getCellText(cell) {
+  const v = cell.value;
+  if (v == null) return "";
+  if (typeof v === "object") {
+    if (v.richText) return v.richText.map(t => t.text).join("");
+    if (v.text != null) return String(v.text);
+    if (v.result != null) return String(v.result);
+    if (v.formula) return "";
+    return String(v);
+  }
+  return String(v);
+}
+
+async function extractXlsx(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+
+  const parts = [];
+  let totalRows = 0, totalCells = 0, shadedCount = 0;
+  const shadedSampleSet = new Set();
+
+  wb.worksheets.forEach((ws) => {
+    parts.push(`<h2>${escapeHtml(ws.name)}</h2>`);
+    parts.push('<table border="1" style="border-collapse:collapse">');
+
+    const mergeSkip = new Set();
+    const mergeSpans = new Map();
+    if (ws.model && ws.model.merges) {
+      for (const range of ws.model.merges) {
+        try {
+          const [topLeft, bottomRight] = range.split(":");
+          const tl = parseRef(topLeft);
+          const br = parseRef(bottomRight);
+          if (!tl || !br) continue;
+          mergeSpans.set(`${tl.row},${tl.col}`, {
+            rowspan: br.row - tl.row + 1,
+            colspan: br.col - tl.col + 1,
+          });
+          for (let r = tl.row; r <= br.row; r++) {
+            for (let c = tl.col; c <= br.col; c++) {
+              if (r === tl.row && c === tl.col) continue;
+              mergeSkip.add(`${r},${c}`);
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    ws.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      const cells = [];
+      let hasContent = false;
+      const maxCol = row.cellCount;
+      for (let c = 1; c <= maxCol; c++) {
+        const key = `${rowNumber},${c}`;
+        if (mergeSkip.has(key)) continue;
+
+        const cell = row.getCell(c);
+        const text = getCellText(cell).trim();
+        if (text) hasContent = true;
+        totalCells++;
+
+        let shaded = false;
+        const fill = cell.fill;
+        if (fill && fill.type === "pattern" && fill.pattern === "solid") {
+          if (isShadedFillXlsx(fill.fgColor)) shaded = true;
+        }
+        if (shaded) {
+          shadedCount++;
+          if (text && shadedSampleSet.size < 10) shadedSampleSet.add(text.substring(0, 40));
+        }
+
+        const bold = !!(cell.font && cell.font.bold);
+
+        const span = mergeSpans.get(key);
+        const spanAttr = span
+          ? `${span.rowspan > 1 ? ` rowspan="${span.rowspan}"` : ""}${span.colspan > 1 ? ` colspan="${span.colspan}"` : ""}`
+          : "";
+
+        let inner = escapeHtml(text);
+        if (bold && text) inner = `<strong>${escapeHtml(text)}</strong>`;
+        if (shaded) inner = `[[SHADED]]${inner}`;
+
+        cells.push(`<td${spanAttr}>${inner}</td>`);
+      }
+      if (hasContent) {
+        parts.push(`<tr>${cells.join("")}</tr>`);
+        totalRows++;
+      }
+    });
+
+    parts.push("</table>");
+  });
+
+  return {
+    html: parts.join("\n"),
+    shadedCount,
+    shadedSampleTexts: [...shadedSampleSet],
+    stats: { sheets: wb.worksheets.length, rows: totalRows, cells: totalCells },
+  };
+}
+
+// =============================================================================
+// PDF — via pdf-parse, Plaintext → <p>-Tags (kein Shading)
+// =============================================================================
+async function extractPdf(buf) {
+  if (!isPdf(buf)) {
+    throw new Error("Invalid PDF payload (missing %PDF header)");
+  }
+  const data = await pdfParse(buf);
+  const text = data.text || "";
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(Boolean)
+    .map(p => `<p>${escapeHtml(p).replace(/\n/g, "<br/>")}</p>`);
+  return {
+    html: paragraphs.join("\n"),
+    shadedCount: 0,
+    shadedSampleTexts: [],
+    stats: { pages: data.numpages, chars: text.length },
+  };
+}
+
+// =============================================================================
+// HTTP HANDLER
+// =============================================================================
 export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(204).end();
+
   try {
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method not allowed" });
     }
-    const { fileName, mimeType, data } = req.body ?? {};
-    if (!data) {
-      return res.status(400).json({ error: "Missing DOCX base64 in 'data'" });
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); }
+      catch (e) { return res.status(400).json({ error: "Body is not valid JSON" }); }
     }
+    if (!body || typeof body !== "object") {
+      return res.status(400).json({ error: "Missing JSON body" });
+    }
+    const { fileName, mimeType, data } = body;
+    if (!data || typeof data !== "string") {
+      return res.status(400).json({ error: "Missing 'data' (base64 string)" });
+    }
+
     const buf = toBufferFromBase64(data);
+    if (buf.length === 0) {
+      return res.status(400).json({ error: "Empty buffer after base64 decode" });
+    }
 
-    const headHex = buf.slice(0, 4).toString("hex");
-    const tailHex = buf.slice(-4).toString("hex");
-    const okZip = isZip(buf);
-    const okEOCD = hasEOCD(buf);
-
-    if (!okZip || !okEOCD || buf.length < 1024) {
+    const format = detectFormat({ fileName, mimeType, buf });
+    if (!format) {
       return res.status(400).json({
-        error: "Invalid DOCX/ZIP payload",
-        details: { length: buf.length, headHex, tailHex, zipHeaderOK: okZip, eocdOK: okEOCD }
+        error: "Unknown format",
+        details: { fileName, mimeType, fileSize: buf.length },
+        hint: "Supported: .docx, .xlsx, .pdf",
       });
     }
 
-    // 1) Mammoth: DOCX -> HTML
-    const result = await mammoth.convertToHtml({ buffer: buf });
-    let html = String(result.value || "").trim();
-
-    // 2) Shading-Extraktion direkt aus document.xml
-    //    (Mammoth verliert die Cell-Shading-Info, wir holen sie selbst raus)
-    let shadedCount = 0;
-    let shadedSampleTexts = [];
-    try {
-      const zip = await JSZip.loadAsync(buf);
-      const docXmlFile = zip.file("word/document.xml");
-      if (docXmlFile) {
-        const docXml = await docXmlFile.async("string");
-        const shadedOccurrences = extractShadedCellTexts(docXml);
-        shadedCount = [...shadedOccurrences.values()].reduce((s, arr) => s + arr.length, 0);
-        shadedSampleTexts = [...shadedOccurrences.keys()].slice(0, 10);
-
-        if (shadedCount > 0) {
-          html = injectShadedMarkers(html, shadedOccurrences);
-        }
-      }
-    } catch (e) {
-      // Fail-soft: wenn Shading-Extraktion failt, geben wir das HTML ohne
-      // Marker zurück und loggen den Fehler. Der bisherige Workflow läuft
-      // damit weiter, nur Mars Q19 wird ohne Marker geparst (= bisheriges
-      // Verhalten).
-      console.warn("Shading extraction failed (non-fatal):", e.message);
-    }
+    let result;
+    if (format === "docx") result = await extractDocx(buf);
+    else if (format === "xlsx") result = await extractXlsx(buf);
+    else if (format === "pdf") result = await extractPdf(buf);
 
     return res.status(200).json({
-      html,
-      // Debug-Felder, damit du im n8n-Output sehen kannst, ob Shading erkannt wurde
-      _shadedCount: shadedCount,
-      _shadedSampleTexts: shadedSampleTexts,
-      _version: "docx-html-v2-shading"
+      html: result.html,
+      _format: format,
+      _shadedCount: result.shadedCount,
+      _shadedSampleTexts: result.shadedSampleTexts,
+      _stats: result.stats || null,
+      _version: "screener-extract-v1.0.0",
     });
   } catch (err) {
-    console.error("docx-html error:", err);
+    console.error("screener-extract error:", err);
     return res.status(500).json({ error: String(err?.message || err) });
   }
 }
+
+export const config = {
+  api: { bodyParser: { sizeLimit: "10mb" } },
+};
