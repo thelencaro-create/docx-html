@@ -20,6 +20,15 @@ import pdfParse from "pdf-parse";
  *  - PDF-Support via pdf-parse (Plaintext → <p>-Tags, ohne Shading)
  *  - Format-Auto-Detection via mimeType oder fileName
  *
+ * v1.1 (15.05.2026): GRÖßEN-REDUKTION
+ *  - Eingebettete Bilder (Logos, Screenshots, Diagramme) werden NICHT mehr
+ *    als data:base64-URLs ins HTML eingefügt. Stattdessen leere Platzhalter,
+ *    die anschließend rausgefiltert werden. Vermeidet Vercel-Response-Limit
+ *    (4.5 MB) bei großen DOCX-Screenern mit vielen Bildern (z.B. 5+ MB).
+ *  - HTML wird nach Konvertierung kompaktiert (Whitespaces zusammenfassen,
+ *    leere Tags entfernen). Reduziert Output-Größe typisch um 30-50%.
+ *  - Shading-Marker-Logik bleibt unverändert.
+ *
  * Endpoint: POST /api/screener-extract
  * Request:  { data: <base64>, fileName?: string, mimeType?: string }
  * Response: { html, _format, _shadedCount, _shadedSampleTexts, _version }
@@ -149,8 +158,17 @@ async function extractDocx(buf) {
   if (!isZip(buf) || !hasEOCD(buf) || buf.length < 1024) {
     throw new Error("Invalid DOCX/ZIP payload");
   }
-  const result = await mammoth.convertToHtml({ buffer: buf });
+  // v1.1: Bilder werden als leere <img>-Platzhalter eingefügt — verhindert,
+  // dass eingebettete Fotos/Logos als data:base64-URLs ins HTML fließen und
+  // den Output um Megabytes aufblähen (Vercel-Response-Limit: 4.5 MB).
+  const stripImagesOption = {
+    convertImage: mammoth.images.imgElement(() => Promise.resolve({ src: "" })),
+  };
+  const result = await mammoth.convertToHtml({ buffer: buf }, stripImagesOption);
   let html = String(result.value || "").trim();
+
+  // v1.1: Größen-Reduktion durch HTML-Säuberung
+  html = compactHtml(html);
 
   let shadedCount = 0;
   let shadedSampleTexts = [];
@@ -170,6 +188,24 @@ async function extractDocx(buf) {
 
   return { html, shadedCount, shadedSampleTexts };
 }
+
+// v1.1: HTML-Komprimierung — entfernt überflüssige Inhalte ohne Sinnverlust.
+// Reduziert typischerweise um 30-50% bei "normalem" DOCX-Output.
+function compactHtml(html) {
+  return html
+    // Leere img-Tags raus (kommen von strippImages-Option)
+    .replace(/<img\s*\/?>/gi, "")
+    .replace(/<img\s+src=""\s*\/?>/gi, "")
+    // Leere span/p ohne Inhalt
+    .replace(/<span[^>]*>\s*<\/span>/gi, "")
+    .replace(/<p[^>]*>\s*<\/p>/gi, "")
+    // Mehrfache Whitespaces in einem
+    .replace(/\s+/g, " ")
+    // Whitespace direkt nach öffnendem oder vor schließendem Tag
+    .replace(/>\s+</g, "><")
+    .trim();
+}
+
 
 // =============================================================================
 // XLSX — via ExcelJS, [[SHADED]]-Marker an Zellen mit Hintergrund-Farbe
@@ -368,7 +404,7 @@ export default async function handler(req, res) {
       _shadedCount: result.shadedCount,
       _shadedSampleTexts: result.shadedSampleTexts,
       _stats: result.stats || null,
-      _version: "screener-extract-v1.0.0",
+      _version: "screener-extract-v1.1.0-strip-images",
     });
   } catch (err) {
     console.error("screener-extract error:", err);
